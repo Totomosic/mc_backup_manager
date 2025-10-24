@@ -611,6 +611,7 @@ def process_backups(
         deletions = determine_backups_to_delete(
             storage_backups, config.retention_checkpoints
         )
+        deletion_count = len(deletions)
         if deletions:
             action = "Would delete" if config.dry_run else "Deleting"
             if config.storage.kind == "local":
@@ -648,6 +649,18 @@ def process_backups(
                     dry_run=config.dry_run,
                     suppress_logging=True,
                 )
+
+        if not config.dry_run and not config.loop:
+            logging.info(
+                "Completed backup cycle: uploaded %s; pruned %d storage backups.",
+                latest_backup.name,
+                deletion_count,
+            )
+    elif not config.dry_run and not config.loop:
+        logging.info(
+            "Completed backup cycle: uploaded %s; no storage pruning required.",
+            latest_backup.name,
+        )
 
     return 0, latest_backup.name
 

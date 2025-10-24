@@ -44,6 +44,20 @@ Key settings inside the `[backup]` section:
 
 All settings can also be passed via CLI flags (run `./backup_manager.py --help` for the full list) to override values loaded from the config file.
 
+### Understanding Retention Checkpoints
+
+Each checkpoint acts like a “bucket size” for progressively older backups. The table below shows how many backups are kept in each age band for a policy such as `3h,24h,7d,30d`:
+
+| Backup Age Range          | Keeper Rule                               |
+|---------------------------|-------------------------------------------|
+| 0 → 3 hours               | Keep every backup.                        |
+| 3 hours → 24 hours        | Keep at most 1 backup per 3-hour bucket.  |
+| 24 hours → 7 days         | Keep at most 1 backup per 24-hour bucket. |
+| 7 days → 30 days          | Keep at most 1 backup per 7-day bucket.   |
+| Beyond the last checkpoint| Keep at most 1 backup per 30-day bucket.  |
+
+This means that even if a server produces hourly backups, the policy quickly collapses older data while preserving recent granularity. Adjust the checkpoints to reflect how much detail you need at various ages.
+
 ## Usage
 
 Run a single backup cycle:
@@ -84,4 +98,3 @@ TMPDIR=$(pwd)/.tmp pytest
 - `config.example.ini` – sample configuration file.
 - `tests/` – unit tests covering backup discovery, pruning logic, and S3 interactions.
 - `create_mock_backup.py` – helper for generating sample backup archives (useful in testing or demos).
-
