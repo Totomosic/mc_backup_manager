@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 BACKUP_FORMAT = "%Y-%m-%d-%H-%M-%S"
 CONFIG_SECTION = "backup"
-NOISY_LOGGERS = ("boto", "boto3", "botocore")
+NOISY_LOGGERS = ("boto", "boto3", "botocore", "urllib3")
 
 
 class ConfigurationError(Exception):
