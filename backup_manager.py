@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple, TypeVar, Union, cast
 from urllib.parse import urlparse
 
 
@@ -331,19 +331,7 @@ def upload_to_s3(
     if dry_run:
         return
 
-    try:
-        import boto3
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "boto3 is required for S3 uploads. Install with `pip install boto3`."
-        ) from exc
-    session_kwargs = {}
-    if aws_profile:
-        session_kwargs["profile_name"] = aws_profile
-    if aws_region:
-        session_kwargs["region_name"] = aws_region
-    session = boto3.Session(**session_kwargs)
-    s3_client = session.client("s3")
+    s3_client = create_s3_client(aws_profile=aws_profile, aws_region=aws_region)
 
     if s3_object_exists(s3_client, bucket, object_key):
         logging.info("Backup %s already present in s3://%s/%s, skipping upload", backup_path.name, bucket, object_key)
@@ -365,6 +353,86 @@ def s3_object_exists(client, bucket: str, key: str) -> bool:
         if error_code in ("404", "NotFound", "NoSuchKey"):
             return False
         raise
+
+
+def create_s3_client(
+    *, aws_profile: Optional[str], aws_region: Optional[str]
+):
+    try:
+        import boto3
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "boto3 is required for S3 operations. Install with `pip install boto3`."
+        ) from exc
+    session_kwargs = {}
+    if aws_profile:
+        session_kwargs["profile_name"] = aws_profile
+    if aws_region:
+        session_kwargs["region_name"] = aws_region
+    session = boto3.Session(**session_kwargs)
+    return session.client("s3")
+
+
+def list_s3_backups(
+    *,
+    bucket: Optional[str],
+    prefix: Optional[str],
+    aws_profile: Optional[str],
+    aws_region: Optional[str],
+) -> List[Tuple[datetime, str]]:
+    if bucket is None:
+        raise ConfigurationError("S3 storage requires a bucket.")
+
+    client = create_s3_client(aws_profile=aws_profile, aws_region=aws_region)
+
+    list_kwargs = {"Bucket": bucket}
+    if prefix:
+        list_kwargs["Prefix"] = prefix.rstrip("/") + "/"
+
+    paginator = client.get_paginator("list_objects_v2")
+    backups: List[Tuple[datetime, str]] = []
+
+    for page in paginator.paginate(**list_kwargs):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            name = Path(key).name
+            if not name.endswith(".zip"):
+                continue
+            try:
+                timestamp = datetime.strptime(Path(name).stem, BACKUP_FORMAT)
+            except ValueError:
+                logging.debug("Skipping non-conforming backup object %s", key)
+                continue
+            backups.append((timestamp, key))
+
+    backups.sort(key=lambda item: item[0])
+    return backups
+
+
+def delete_s3_backups(
+    keys: Iterable[str],
+    *,
+    bucket: Optional[str],
+    aws_profile: Optional[str],
+    aws_region: Optional[str],
+    dry_run: bool,
+) -> None:
+    if bucket is None:
+        raise ConfigurationError("S3 storage requires a bucket.")
+
+    keys_list = list(keys)
+    if not keys_list:
+        return
+
+    for key in keys_list:
+        logging.info("Deleting old backup s3://%s/%s", bucket, key)
+
+    if dry_run:
+        return
+
+    client = create_s3_client(aws_profile=aws_profile, aws_region=aws_region)
+    for key in keys_list:
+        client.delete_object(Bucket=bucket, Key=key)
 
 
 def copy_to_local(backup_path: Path, *, destination: Optional[Path], dry_run: bool) -> None:
@@ -396,9 +464,12 @@ def _timestamp_slot(timestamp: datetime, granularity_seconds: int) -> int:
     return seconds // granularity_seconds
 
 
+BackupPath = TypeVar("BackupPath")
+
+
 def determine_backups_to_delete(
-    backups: List[Tuple[datetime, Path]], retention_checkpoints: List[int]
-) -> List[Path]:
+    backups: List[Tuple[datetime, BackupPath]], retention_checkpoints: List[int]
+) -> List[BackupPath]:
     if len(backups) <= 1:
         return []
 
@@ -406,7 +477,7 @@ def determine_backups_to_delete(
         return [path for _, path in backups[:-1]]
 
     durations = retention_checkpoints
-    to_delete: List[Path] = []
+    to_delete: List[BackupPath] = []
     seen_slots: Set[Tuple[int, int]] = set()
     reference_time = backups[-1][0]
 
@@ -438,13 +509,23 @@ def delete_old_backups(backups: Iterable[Path], *, dry_run: bool) -> None:
         backup.unlink(missing_ok=True)
 
 
-def find_storage_backups(config: BackupConfig) -> List[Tuple[datetime, Path]]:
-    if config.storage.kind != "local":
-        return []
-    storage_path = config.storage.path
-    if storage_path is None or not storage_path.exists():
-        return []
-    return find_backups(storage_path)
+def find_storage_backups(
+    config: BackupConfig,
+) -> List[Tuple[datetime, Union[Path, str]]]:
+    if config.storage.kind == "local":
+        storage_path = config.storage.path
+        if storage_path is None or not storage_path.exists():
+            return []
+        return find_backups(storage_path)
+    if config.storage.kind == "s3":
+        backups = list_s3_backups(
+            bucket=config.storage.bucket,
+            prefix=config.storage.prefix,
+            aws_profile=config.aws_profile,
+            aws_region=config.aws_region,
+        )
+        return backups
+    return []
 
 
 def process_backups(
@@ -479,7 +560,18 @@ def process_backups(
         deletions = determine_backups_to_delete(
             storage_backups, config.retention_checkpoints
         )
-        delete_old_backups(deletions, dry_run=config.dry_run)
+        if config.storage.kind == "local":
+            local_paths = cast(List[Path], deletions)
+            delete_old_backups(local_paths, dry_run=config.dry_run)
+        elif config.storage.kind == "s3":
+            s3_keys = cast(List[str], deletions)
+            delete_s3_backups(
+                s3_keys,
+                bucket=config.storage.bucket,
+                aws_profile=config.aws_profile,
+                aws_region=config.aws_region,
+                dry_run=config.dry_run,
+            )
 
     return 0, latest_backup.name
 

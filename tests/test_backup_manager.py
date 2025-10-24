@@ -2,7 +2,7 @@ import sys
 import types
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -328,6 +328,90 @@ def test_process_backups_hourly_with_multi_tier_retention(tmp_path: Path) -> Non
     backup_dir_remaining = sorted(path.name for path in backup_dir.iterdir())
     assert backup_dir_remaining == [expected_storage[-1]]
 
+
+def test_process_backups_applies_retention_to_s3_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+
+    names = [
+        "2024-02-01-00-00-00.zip",
+        "2024-02-05-00-00-00.zip",
+        "2024-02-10-00-00-00.zip",
+        "2024-03-01-00-00-00.zip",
+        "2024-03-05-00-00-00.zip",
+        "2024-03-05-12-00-00.zip",
+        "2024-03-09-00-00-00.zip",
+        "2024-03-09-12-00-00.zip",
+        "2024-03-10-00-00-00.zip",
+    ]
+
+    for index, name in enumerate(names):
+        make_backup(backup_dir, name, f"payload-{index}".encode())
+
+    config = build_config(
+        backup_dir=backup_dir,
+        storage=StorageTarget(kind="s3", bucket="my-bucket", prefix="world"),
+        retention_checkpoints=[24 * 60 * 60, 7 * 24 * 60 * 60, 30 * 24 * 60 * 60],
+    )
+
+    uploads: List[str] = []
+
+    def fake_upload(cfg: BackupConfig, path: Path) -> None:
+        uploads.append(path.name)
+
+    monkeypatch.setattr(backup_manager, "upload_backup", fake_upload)
+
+    s3_backups = [
+        (
+            datetime.strptime(name[:-4], BACKUP_FORMAT),
+            f"world/{name}",
+        )
+        for name in names
+    ]
+
+    def fake_list_s3_backups(
+        *,
+        bucket: Optional[str],
+        prefix: Optional[str],
+        aws_profile: Optional[str],
+        aws_region: Optional[str],
+    ) -> List[Tuple[datetime, str]]:
+        assert bucket == "my-bucket"
+        assert prefix == "world"
+        return s3_backups
+
+    monkeypatch.setattr(backup_manager, "list_s3_backups", fake_list_s3_backups)
+
+    deletions: List[str] = []
+
+    def fake_delete_s3_backups(
+        keys: Iterable[str],
+        *,
+        bucket: Optional[str],
+        aws_profile: Optional[str],
+        aws_region: Optional[str],
+        dry_run: bool,
+    ) -> None:
+        assert bucket == "my-bucket"
+        assert not dry_run
+        deletions.extend(keys)
+
+    monkeypatch.setattr(backup_manager, "delete_s3_backups", fake_delete_s3_backups)
+
+    exit_code, last_uploaded = process_backups(config, last_uploaded=None)
+
+    assert exit_code == 0
+    assert last_uploaded == names[-1]
+    assert uploads == [names[-1]]
+    assert deletions == [
+        "world/2024-03-05-00-00-00.zip",
+        "world/2024-02-01-00-00-00.zip",
+    ]
+
+    remaining_local = sorted(path.name for path in backup_dir.iterdir())
+    assert remaining_local == [names[-1]]
 
 def test_process_backups_applies_retention_checkpoints_2(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
