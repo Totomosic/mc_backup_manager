@@ -1,3 +1,4 @@
+import logging
 import sys
 import types
 from datetime import datetime, timedelta
@@ -15,6 +16,7 @@ from backup_manager import (
     BACKUP_FORMAT,
     BackupConfig,
     StorageTarget,
+    configure_logging,
     process_backups,
     upload_to_s3,
 )
@@ -43,6 +45,35 @@ def build_config(
         dry_run=dry_run,
         retention_checkpoints=list(retention_checkpoints or []),
     )
+
+
+def test_configure_logging_only_adjusts_root() -> None:
+    root_logger = logging.getLogger()
+    original_level = root_logger.level
+    original_handlers = list(root_logger.handlers)
+
+    for handler in original_handlers:
+        root_logger.removeHandler(handler)
+
+    tracked_loggers = ("boto", "boto3", "botocore")
+    original_child_levels = {
+        name: logging.getLogger(name).level for name in tracked_loggers
+    }
+
+    try:
+        configure_logging("DEBUG")
+
+        assert root_logger.level == logging.DEBUG
+        for name in tracked_loggers:
+            assert logging.getLogger(name).level == logging.WARNING
+    finally:
+        root_logger.setLevel(original_level)
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+        for handler in original_handlers:
+            root_logger.addHandler(handler)
+        for name, level in original_child_levels.items():
+            logging.getLogger(name).setLevel(level)
 
 
 def setup_fake_boto3(monkeypatch: pytest.MonkeyPatch, *, object_exists: bool) -> Tuple[List[Tuple[str, str, str]], Dict[str, str]]:
@@ -126,6 +157,36 @@ def test_process_backups_local_storage_copies_and_prunes(tmp_path: Path) -> None
     assert copied_file.exists()
     assert copied_file.read_bytes() == latest_file.read_bytes()
 
+
+def test_process_backups_dry_run_does_not_mutate_files(tmp_path: Path) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    destination = tmp_path / "storage"
+    destination.mkdir()
+
+    old_name = "2024-01-01-12-00-00.zip"
+    latest_name = "2024-01-01-14-00-00.zip"
+
+    old_file = make_backup(backup_dir, old_name, b"old")
+    latest_file = make_backup(backup_dir, latest_name, b"latest")
+
+    config = build_config(
+        backup_dir=backup_dir,
+        storage=StorageTarget(kind="local", path=destination),
+        dry_run=True,
+    )
+
+    exit_code, last_uploaded = process_backups(config, last_uploaded=None)
+
+    assert exit_code == 0
+    assert last_uploaded == latest_name
+
+    # Dry run should not delete older backups or remove the latest file.
+    assert old_file.exists()
+    assert latest_file.exists()
+
+    # Destination directory should remain untouched.
+    assert not any(destination.iterdir())
 
 def test_process_backups_applies_retention_checkpoints(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"

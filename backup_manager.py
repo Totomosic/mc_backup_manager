@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 BACKUP_FORMAT = "%Y-%m-%d-%H-%M-%S"
 CONFIG_SECTION = "backup"
+NOISY_LOGGERS = ("boto", "boto3", "botocore")
 
 
 class ConfigurationError(Exception):
@@ -221,6 +222,11 @@ def parse_int(value: str, name: str) -> int:
         raise ConfigurationError(f"{name} must be an integer.") from error
 
 
+def _quiet_external_loggers() -> None:
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def parse_duration(value: str) -> int:
     units = {
         "s": 1,
@@ -364,6 +370,7 @@ def create_s3_client(
         raise RuntimeError(
             "boto3 is required for S3 operations. Install with `pip install boto3`."
         ) from exc
+    _quiet_external_loggers()
     session_kwargs = {}
     if aws_profile:
         session_kwargs["profile_name"] = aws_profile
@@ -528,6 +535,14 @@ def find_storage_backups(
     return []
 
 
+def configure_logging(log_level: str) -> None:
+    level = getattr(logging, log_level.upper(), None)
+    if level is None:
+        raise ValueError(f"Invalid log level: {log_level}")
+    logging.basicConfig(level=level)
+    _quiet_external_loggers()
+
+
 def process_backups(
     config: BackupConfig, *, last_uploaded: Optional[str]
 ) -> Tuple[int, Optional[str]]:
@@ -578,7 +593,11 @@ def process_backups(
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()))
+    try:
+        configure_logging(args.log_level)
+    except ValueError as error:
+        logging.error("%s", error)
+        return 2
 
     file_config: Optional[Dict[str, str]] = None
     if args.config:
