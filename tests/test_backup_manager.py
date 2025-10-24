@@ -391,7 +391,9 @@ def test_process_backups_hourly_with_multi_tier_retention(tmp_path: Path) -> Non
 
 
 def test_process_backups_applies_retention_to_s3_storage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
@@ -454,12 +456,16 @@ def test_process_backups_applies_retention_to_s3_storage(
         aws_profile: Optional[str],
         aws_region: Optional[str],
         dry_run: bool,
+        suppress_logging: bool = False,
     ) -> None:
         assert bucket == "my-bucket"
         assert not dry_run
+        assert suppress_logging is True
         deletions.extend(keys)
 
     monkeypatch.setattr(backup_manager, "delete_s3_backups", fake_delete_s3_backups)
+
+    caplog.set_level(logging.INFO)
 
     exit_code, last_uploaded = process_backups(config, last_uploaded=None)
 
@@ -473,6 +479,11 @@ def test_process_backups_applies_retention_to_s3_storage(
 
     remaining_local = sorted(path.name for path in backup_dir.iterdir())
     assert remaining_local == [names[-1]]
+
+    storage_log_messages = [
+        record.message for record in caplog.records if "storage backup" in record.message
+    ]
+    assert any("Retention checkpoint" in message for message in storage_log_messages)
 
 def test_process_backups_applies_retention_checkpoints_2(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
@@ -521,6 +532,52 @@ def test_process_backups_applies_retention_checkpoints_2(tmp_path: Path) -> None
         "2024-01-04-00-00-00.zip",
     ]
 
+
+def test_process_backups_incremental_retention(tmp_path: Path) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    destination = tmp_path / "storage"
+    destination.mkdir()
+
+    names = [
+        "2024-01-01-00-00-00.zip",
+        "2024-01-01-06-00-00.zip",
+        "2024-01-01-12-00-00.zip",
+        "2024-01-01-18-00-00.zip",
+        "2024-01-02-00-00-00.zip",
+        "2024-01-02-06-00-00.zip",
+        "2024-01-02-12-00-00.zip",
+        "2024-01-02-18-00-00.zip",
+        "2024-01-03-00-00-00.zip",
+        "2024-01-03-06-00-00.zip",
+        "2024-01-04-00-00-00.zip",
+    ]
+
+    config = build_config(
+        backup_dir=backup_dir,
+        storage=StorageTarget(kind="local", path=destination),
+        retention_checkpoints=[24 * 60 * 60],
+    )
+
+    last_uploaded: Optional[str] = None
+    for index, name in enumerate(names):
+        make_backup(backup_dir, name, f"payload-{index}".encode())
+        exit_code, last_uploaded = process_backups(
+            config, last_uploaded=last_uploaded
+        )
+        assert exit_code == 0
+        assert last_uploaded == name
+        remaining_local = sorted(path.name for path in backup_dir.iterdir())
+        assert remaining_local == [name]
+
+    storage_remaining = sorted(path.name for path in destination.iterdir())
+    assert storage_remaining == [
+        "2024-01-01-18-00-00.zip",
+        "2024-01-02-18-00-00.zip",
+        "2024-01-03-00-00-00.zip",
+        "2024-01-03-06-00-00.zip",
+        "2024-01-04-00-00-00.zip",
+    ]
 
 def test_copy_to_local_skips_existing_file(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"

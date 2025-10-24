@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple, TypeVar, Union, cast
+from typing import Dict, Generic, Iterable, List, Optional, Set, Tuple, TypeVar, Union, cast
 from urllib.parse import urlparse
 
 
@@ -227,6 +227,22 @@ def _quiet_external_loggers() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def format_duration(seconds: int) -> str:
+    units = [
+        (7 * 24 * 60 * 60, "week"),
+        (24 * 60 * 60, "day"),
+        (60 * 60, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ]
+    for unit_seconds, label in units:
+        if seconds >= unit_seconds and seconds % unit_seconds == 0:
+            value = seconds // unit_seconds
+            name = label if value == 1 else f"{label}s"
+            return f"{value} {name}"
+    return f"{seconds} seconds"
+
+
 def parse_duration(value: str) -> int:
     units = {
         "s": 1,
@@ -423,6 +439,7 @@ def delete_s3_backups(
     aws_profile: Optional[str],
     aws_region: Optional[str],
     dry_run: bool,
+    suppress_logging: bool = False,
 ) -> None:
     if bucket is None:
         raise ConfigurationError("S3 storage requires a bucket.")
@@ -432,7 +449,8 @@ def delete_s3_backups(
         return
 
     for key in keys_list:
-        logging.info("Deleting old backup s3://%s/%s", bucket, key)
+        if not suppress_logging:
+            logging.info("Deleting old backup s3://%s/%s", bucket, key)
 
     if dry_run:
         return
@@ -474,17 +492,29 @@ def _timestamp_slot(timestamp: datetime, granularity_seconds: int) -> int:
 BackupPath = TypeVar("BackupPath")
 
 
+@dataclass
+class RetentionDeletion(Generic[BackupPath]):
+    target: BackupPath
+    reason: str
+
+
 def determine_backups_to_delete(
     backups: List[Tuple[datetime, BackupPath]], retention_checkpoints: List[int]
-) -> List[BackupPath]:
+) -> List[RetentionDeletion[BackupPath]]:
     if len(backups) <= 1:
         return []
 
     if not retention_checkpoints:
-        return [path for _, path in backups[:-1]]
+        return [
+            RetentionDeletion(
+                path,
+                "Retention policy has no checkpoints configured; keeping only the most recent backup.",
+            )
+            for _, path in backups[:-1]
+        ]
 
     durations = retention_checkpoints
-    to_delete: List[BackupPath] = []
+    to_delete: List[RetentionDeletion[BackupPath]] = []
     seen_slots: Set[Tuple[int, int]] = set()
     reference_time = backups[-1][0]
 
@@ -497,20 +527,26 @@ def determine_backups_to_delete(
         while bucket_index < len(durations) and age_seconds > durations[bucket_index]:
             bucket_index += 1
 
-        granularity_seconds = durations[min(bucket_index - 1, len(durations) - 1)]
+        index_for_label = min(max(bucket_index - 1, 0), len(durations) - 1)
+        granularity_seconds = durations[index_for_label]
         slot_key = (bucket_index, _timestamp_slot(timestamp, granularity_seconds))
 
         if slot_key in seen_slots:
-            to_delete.append(path)
+            reason = (
+                f"Retention checkpoint {format_duration(granularity_seconds)}: "
+                "a newer backup already covers this interval."
+            )
+            to_delete.append(RetentionDeletion(path, reason))
         else:
             seen_slots.add(slot_key)
 
     return to_delete
 
 
-def delete_old_backups(backups: Iterable[Path], *, dry_run: bool) -> None:
+def delete_old_backups(backups: Iterable[Path], *, dry_run: bool, suppress_logging: bool = False) -> None:
     for backup in backups:
-        logging.info("Deleting old backup %s", backup)
+        if not suppress_logging:
+            logging.info("Deleting old backup %s", backup)
         if dry_run:
             continue
         backup.unlink(missing_ok=True)
@@ -575,18 +611,43 @@ def process_backups(
         deletions = determine_backups_to_delete(
             storage_backups, config.retention_checkpoints
         )
-        if config.storage.kind == "local":
-            local_paths = cast(List[Path], deletions)
-            delete_old_backups(local_paths, dry_run=config.dry_run)
-        elif config.storage.kind == "s3":
-            s3_keys = cast(List[str], deletions)
-            delete_s3_backups(
-                s3_keys,
-                bucket=config.storage.bucket,
-                aws_profile=config.aws_profile,
-                aws_region=config.aws_region,
-                dry_run=config.dry_run,
-            )
+        if deletions:
+            action = "Would delete" if config.dry_run else "Deleting"
+            if config.storage.kind == "local":
+                local_paths: List[Path] = []
+                for candidate in deletions:
+                    path = cast(Path, candidate.target)
+                    logging.info(
+                        "%s storage backup %s: %s",
+                        action,
+                        path,
+                        candidate.reason,
+                    )
+                    local_paths.append(path)
+                delete_old_backups(
+                    local_paths, dry_run=config.dry_run, suppress_logging=True
+                )
+            elif config.storage.kind == "s3":
+                bucket = config.storage.bucket or ""
+                s3_keys: List[str] = []
+                for candidate in deletions:
+                    key = cast(str, candidate.target)
+                    logging.info(
+                        "%s storage backup s3://%s/%s: %s",
+                        action,
+                        bucket,
+                        key,
+                        candidate.reason,
+                    )
+                    s3_keys.append(key)
+                delete_s3_backups(
+                    s3_keys,
+                    bucket=config.storage.bucket,
+                    aws_profile=config.aws_profile,
+                    aws_region=config.aws_region,
+                    dry_run=config.dry_run,
+                    suppress_logging=True,
+                )
 
     return 0, latest_backup.name
 
