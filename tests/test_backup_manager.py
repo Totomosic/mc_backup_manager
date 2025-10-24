@@ -1,5 +1,6 @@
 import sys
 import types
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -10,7 +11,13 @@ if str(ROOT) not in sys.path:
 import pytest
 
 import backup_manager
-from backup_manager import BackupConfig, StorageTarget, process_backups, upload_to_s3
+from backup_manager import (
+    BACKUP_FORMAT,
+    BackupConfig,
+    StorageTarget,
+    process_backups,
+    upload_to_s3,
+)
 
 
 def make_backup(path: Path, name: str, content: bytes) -> Path:
@@ -165,6 +172,162 @@ def test_process_backups_applies_retention_checkpoints(tmp_path: Path) -> None:
         "2024-01-02-18-00-00.zip",
         "2024-01-03-00-00-00.zip",
     ]
+
+
+def test_process_backups_applies_multiple_retention_tiers(tmp_path: Path) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    destination = tmp_path / "storage"
+    destination.mkdir()
+
+    base_time = datetime(2024, 3, 1, 0, 0)
+    offsets = [
+        timedelta(days=35),
+        timedelta(days=32),
+        timedelta(days=28),
+        timedelta(days=20),
+        timedelta(days=14),
+        timedelta(days=8),
+        timedelta(days=6, hours=12),
+        timedelta(days=6),
+        timedelta(days=5),
+        timedelta(days=4, hours=12),
+        timedelta(days=3, hours=12),
+        timedelta(days=3),
+        timedelta(days=2, hours=12),
+        timedelta(days=1, hours=18),
+        timedelta(hours=18),
+        timedelta(hours=12),
+        timedelta(hours=6),
+        timedelta(),
+    ]
+
+    names: List[str] = []
+    for index, delta in enumerate(offsets):
+        timestamp = base_time - delta
+        name = timestamp.strftime(BACKUP_FORMAT) + ".zip"
+        names.append(name)
+        make_backup(backup_dir, name, f"local-{index}".encode())
+        make_backup(destination, name, f"storage-{index}".encode())
+
+    config = build_config(
+        backup_dir=backup_dir,
+        storage=StorageTarget(kind="local", path=destination),
+        retention_checkpoints=[
+            24 * 60 * 60,
+            7 * 24 * 60 * 60,
+            30 * 24 * 60 * 60,
+        ],
+    )
+
+    exit_code, last_uploaded = process_backups(config, last_uploaded=None)
+
+    assert exit_code == 0
+    assert last_uploaded == names[-1]
+
+    expected_storage = [
+        "2024-01-29-00-00-00.zip",
+        "2024-02-02-00-00-00.zip",
+        "2024-02-10-00-00-00.zip",
+        "2024-02-16-00-00-00.zip",
+        "2024-02-22-00-00-00.zip",
+        "2024-02-23-12-00-00.zip",
+        "2024-02-24-00-00-00.zip",
+        "2024-02-25-12-00-00.zip",
+        "2024-02-26-12-00-00.zip",
+        "2024-02-27-12-00-00.zip",
+        "2024-02-28-06-00-00.zip",
+        "2024-02-29-06-00-00.zip",
+        "2024-02-29-12-00-00.zip",
+        "2024-02-29-18-00-00.zip",
+        "2024-03-01-00-00-00.zip",
+    ]
+
+    storage_remaining = sorted(path.name for path in destination.iterdir())
+    assert storage_remaining == expected_storage
+
+    backup_dir_remaining = sorted(path.name for path in backup_dir.iterdir())
+    assert backup_dir_remaining == [expected_storage[-1]]
+
+
+def test_process_backups_hourly_with_multi_tier_retention(tmp_path: Path) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    destination = tmp_path / "storage"
+    destination.mkdir()
+
+    base_time = datetime(2024, 4, 1, 0, 0)
+    total_hours = 31 * 24
+    names: List[str] = []
+
+    for index, hours in enumerate(range(total_hours - 1, -1, -1)):
+        timestamp = base_time - timedelta(hours=hours)
+        name = timestamp.strftime(BACKUP_FORMAT) + ".zip"
+        names.append(name)
+        make_backup(backup_dir, name, f"local-hour-{index}".encode())
+        make_backup(destination, name, f"storage-hour-{index}".encode())
+
+    retention = [
+        24 * 60 * 60,
+        7 * 24 * 60 * 60,
+        30 * 24 * 60 * 60,
+    ]
+    expected_storage = [
+        "2024-03-01-23-00-00.zip",
+        "2024-03-06-23-00-00.zip",
+        "2024-03-13-23-00-00.zip",
+        "2024-03-20-23-00-00.zip",
+        "2024-03-24-23-00-00.zip",
+        "2024-03-25-23-00-00.zip",
+        "2024-03-26-23-00-00.zip",
+        "2024-03-27-23-00-00.zip",
+        "2024-03-28-23-00-00.zip",
+        "2024-03-29-23-00-00.zip",
+        "2024-03-30-23-00-00.zip",
+        "2024-03-31-00-00-00.zip",
+        "2024-03-31-01-00-00.zip",
+        "2024-03-31-02-00-00.zip",
+        "2024-03-31-03-00-00.zip",
+        "2024-03-31-04-00-00.zip",
+        "2024-03-31-05-00-00.zip",
+        "2024-03-31-06-00-00.zip",
+        "2024-03-31-07-00-00.zip",
+        "2024-03-31-08-00-00.zip",
+        "2024-03-31-09-00-00.zip",
+        "2024-03-31-10-00-00.zip",
+        "2024-03-31-11-00-00.zip",
+        "2024-03-31-12-00-00.zip",
+        "2024-03-31-13-00-00.zip",
+        "2024-03-31-14-00-00.zip",
+        "2024-03-31-15-00-00.zip",
+        "2024-03-31-16-00-00.zip",
+        "2024-03-31-17-00-00.zip",
+        "2024-03-31-18-00-00.zip",
+        "2024-03-31-19-00-00.zip",
+        "2024-03-31-20-00-00.zip",
+        "2024-03-31-21-00-00.zip",
+        "2024-03-31-22-00-00.zip",
+        "2024-03-31-23-00-00.zip",
+        "2024-04-01-00-00-00.zip",
+    ]
+
+    config = build_config(
+        backup_dir=backup_dir,
+        storage=StorageTarget(kind="local", path=destination),
+        retention_checkpoints=retention,
+    )
+
+    exit_code, last_uploaded = process_backups(config, last_uploaded=None)
+
+    assert exit_code == 0
+    assert last_uploaded == names[-1]
+
+    storage_remaining = sorted(path.name for path in destination.iterdir())
+    assert storage_remaining == expected_storage
+
+    backup_dir_remaining = sorted(path.name for path in backup_dir.iterdir())
+    assert backup_dir_remaining == [expected_storage[-1]]
+
 
 def test_process_backups_applies_retention_checkpoints_2(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
