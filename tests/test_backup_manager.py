@@ -15,11 +15,13 @@ import backup_manager
 from backup_manager import (
     BACKUP_FORMAT,
     BackupConfig,
+    DriveFileRef,
     StoragePolicy,
     StorageTarget,
     configure_logging,
     process_backups,
     upload_to_s3,
+    upload_to_gdrive,
 )
 
 
@@ -147,6 +149,77 @@ def setup_fake_boto3(monkeypatch: pytest.MonkeyPatch, *, object_exists: bool) ->
     monkeypatch.setitem(sys.modules, "botocore.exceptions", fake_botocore_exceptions)
 
     return uploads, session_kwargs
+
+
+def setup_fake_gdrive(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    existing_files: Optional[List[str]] = None,
+) -> Tuple[List[str], List[str], Dict[str, str]]:
+    existing = existing_files or []
+    created: List[str] = []
+    deleted: List[str] = []
+    name_to_id: Dict[str, str] = {name: f"id-{index}" for index, name in enumerate(existing, start=1)}
+
+    class FakeRequest:
+        def __init__(self, result: dict) -> None:
+            self._result = result
+
+        def execute(self) -> dict:
+            return self._result
+
+    class FakeFiles:
+        def list(self, *, q: str, spaces: str, pageSize: int, fields: str, pageToken: Optional[str] = None) -> FakeRequest:
+            assert spaces == "drive"
+            files = []
+            if "name =" in q:
+                target_name = q.split("name = '", 1)[1].split("'", 1)[0].replace("\\'", "'")
+                if target_name in name_to_id:
+                    files.append({"id": name_to_id[target_name], "name": target_name})
+            else:
+                for name, file_id in name_to_id.items():
+                    files.append({"id": file_id, "name": name})
+            return FakeRequest({"files": files, "nextPageToken": None})
+
+        def create(self, *, body: dict, media_body, fields: str) -> FakeRequest:
+            name = body["name"]
+            if name in name_to_id:
+                # Simulate Drive behavior by returning the existing file.
+                return FakeRequest({"id": name_to_id[name]})
+            new_id = f"id-{len(name_to_id) + 1}"
+            name_to_id[name] = new_id
+            created.append(name)
+            return FakeRequest({"id": new_id})
+
+        def delete(self, *, fileId: str) -> FakeRequest:
+            deleted.append(fileId)
+            for key, value in list(name_to_id.items()):
+                if value == fileId:
+                    del name_to_id[key]
+                    break
+            return FakeRequest({})
+
+    class FakeService:
+        def files(self) -> FakeFiles:
+            return FakeFiles()
+
+    fake_http = types.ModuleType("googleapiclient.http")
+
+    class FakeMediaFileUpload:
+        def __init__(self, filename: str, resumable: bool) -> None:
+            self.filename = filename
+            self.resumable = resumable
+
+    fake_http.MediaFileUpload = FakeMediaFileUpload  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "googleapiclient.http", fake_http)
+
+    monkeypatch.setattr(
+        backup_manager,
+        "create_gdrive_service",
+        lambda credentials_path: FakeService(),
+    )
+
+    return created, deleted, name_to_id
 
 
 def test_process_backups_local_storage_copies_and_prunes(tmp_path: Path) -> None:
@@ -554,6 +627,53 @@ def test_process_backups_applies_retention_to_s3_storage(
     ]
     assert any("Retention checkpoint" in message for message in storage_log_messages)
 
+
+def test_process_backups_applies_retention_to_gdrive_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+
+    names = [
+        "2024-02-01-00-00-00.zip",
+        "2024-02-05-00-00-00.zip",
+        "2024-02-10-00-00-00.zip",
+        "2024-03-01-00-00-00.zip",
+        "2024-03-05-00-00-00.zip",
+        "2024-03-05-12-00-00.zip",
+        "2024-03-09-00-00-00.zip",
+        "2024-03-09-12-00-00.zip",
+        "2024-03-10-00-00-00.zip",
+    ]
+
+    for index, name in enumerate(names):
+        make_backup(backup_dir, name, f"payload-{index}".encode())
+
+    created, deleted, name_to_id = setup_fake_gdrive(
+        monkeypatch, existing_files=names
+    )
+    initial_ids = dict(name_to_id)
+
+    config = build_config(
+        backup_dir=backup_dir,
+        storage=StorageTarget(kind="gdrive", drive_folder_id="folder-id"),
+        retention_checkpoints=[24 * 60 * 60, 7 * 24 * 60 * 60, 30 * 24 * 60 * 60],
+    )
+
+    exit_code, last_uploaded = process_backups(config, last_uploaded=None)
+
+    assert exit_code == 0
+    assert last_uploaded == names[-1]
+    assert created == []
+    expected_deleted = [
+        initial_ids["2024-03-05-00-00-00.zip"],
+        initial_ids["2024-02-01-00-00-00.zip"],
+    ]
+    assert deleted == expected_deleted
+
+    remaining_local = sorted(path.name for path in backup_dir.iterdir())
+    assert remaining_local == [names[-1]]
+
 def test_process_backups_applies_retention_checkpoints_2(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
@@ -737,3 +857,37 @@ def test_upload_to_s3_skips_existing(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     )
 
     assert uploads == []
+
+
+def test_upload_to_gdrive_uses_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    created, _, _ = setup_fake_gdrive(monkeypatch)
+
+    backup_file = tmp_path / "2024-05-01-00-00-00.zip"
+    backup_file.write_bytes(b"data")
+
+    upload_to_gdrive(
+        backup_file,
+        target=StorageTarget(kind="gdrive", drive_folder_id="folder-id"),
+        credentials_path=None,
+        dry_run=False,
+    )
+
+    assert created == [backup_file.name]
+
+
+def test_upload_to_gdrive_skips_existing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    created, _, _ = setup_fake_gdrive(
+        monkeypatch, existing_files=["2024-05-02-00-00-00.zip"]
+    )
+
+    backup_file = tmp_path / "2024-05-02-00-00-00.zip"
+    backup_file.write_bytes(b"data")
+
+    upload_to_gdrive(
+        backup_file,
+        target=StorageTarget(kind="gdrive", drive_folder_id="folder-id"),
+        credentials_path=None,
+        dry_run=False,
+    )
+
+    assert created == []

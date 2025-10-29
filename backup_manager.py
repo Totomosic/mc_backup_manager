@@ -34,6 +34,7 @@ class StorageTarget:
     bucket: Optional[str] = None
     prefix: Optional[str] = None
     path: Optional[Path] = None
+    drive_folder_id: Optional[str] = None
 
 
 @dataclass
@@ -42,12 +43,19 @@ class StoragePolicy:
     retention_checkpoints: List[int] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class DriveFileRef:
+    file_id: str
+    name: str
+
+
 @dataclass
 class BackupConfig:
     backup_dir: Path
     storages: List[StoragePolicy]
     aws_profile: Optional[str] = None
     aws_region: Optional[str] = None
+    gdrive_credentials: Optional[Path] = None
     loop: bool = False
     poll_interval: int = 60
     dry_run: bool = False
@@ -92,6 +100,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--aws-region",
         help="AWS region when creating the S3 client.",
+    )
+    parser.add_argument(
+        "--gdrive-credentials",
+        type=Path,
+        help="Path to a Google service account JSON credentials file for Google Drive uploads.",
     )
     parser.add_argument(
         "--log-level",
@@ -152,6 +165,11 @@ def merge_config(
     backup_dir_value = args.backup_dir or file_cfg.get("backup_dir")
     aws_profile = args.aws_profile if args.aws_profile is not None else file_cfg.get("aws_profile")
     aws_region = args.aws_region if args.aws_region is not None else file_cfg.get("aws_region")
+    gdrive_credentials_value: Optional[Union[Path, str]]
+    if args.gdrive_credentials is not None:
+        gdrive_credentials_value = args.gdrive_credentials
+    else:
+        gdrive_credentials_value = file_cfg.get("gdrive_credentials")
 
     loop_value = file_cfg.get("loop")
     if args.loop is not None:
@@ -214,11 +232,21 @@ def merge_config(
             StoragePolicy(target=target, retention_checkpoints=retention_policy)
         )
 
+    gdrive_credentials: Optional[Path]
+    if gdrive_credentials_value:
+        if isinstance(gdrive_credentials_value, Path):
+            gdrive_credentials = gdrive_credentials_value.expanduser().resolve()
+        else:
+            gdrive_credentials = Path(gdrive_credentials_value).expanduser().resolve()
+    else:
+        gdrive_credentials = None
+
     return BackupConfig(
         backup_dir=backup_dir,
         storages=storages,
         aws_profile=aws_profile,
         aws_region=aws_region,
+        gdrive_credentials=gdrive_credentials,
         loop=loop,
         poll_interval=poll_value,
         dry_run=args.dry_run,
@@ -315,6 +343,16 @@ def parse_storage(storage_uri: str) -> StorageTarget:
             raise ConfigurationError("S3 URI must include a bucket name.")
         prefix = parsed.path.lstrip("/")
         return StorageTarget(kind="s3", bucket=parsed.netloc, prefix=prefix or None)
+
+    if scheme == "gdrive":
+        folder_id_parts = [part for part in (parsed.netloc, parsed.path.strip("/")) if part]
+        if not folder_id_parts:
+            raise ConfigurationError("Google Drive URI must include a folder identifier.")
+        if len(folder_id_parts) > 1:
+            raise ConfigurationError(
+                "Google Drive URIs should use the form gdrive://<folder_id>."
+            )
+        return StorageTarget(kind="gdrive", drive_folder_id=folder_id_parts[0])
 
     if scheme in ("", "file"):
         path_str = parsed.path if scheme == "file" else storage_uri
@@ -447,6 +485,13 @@ def upload_backup(config: BackupConfig, backup_path: Path) -> None:
         elif target.kind == "local":
             copy_to_local(
                 backup_path, destination=target.path, dry_run=config.dry_run
+            )
+        elif target.kind == "gdrive":
+            upload_to_gdrive(
+                backup_path,
+                target=target,
+                credentials_path=config.gdrive_credentials,
+                dry_run=config.dry_run,
             )
         else:
             raise ConfigurationError(f"Unsupported storage kind: {target.kind}")
@@ -594,6 +639,190 @@ def delete_s3_backups(
         client.delete_object(Bucket=bucket, Key=key)
 
 
+_GDRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
+]
+
+
+def create_gdrive_service(credentials_path: Optional[Path]):
+    try:
+        from googleapiclient.discovery import build  # type: ignore[import]
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "google-api-python-client is required for Google Drive operations. "
+            "Install with `pip install google-api-python-client google-auth`."
+        ) from exc
+
+    try:
+        from google.oauth2.service_account import Credentials  # type: ignore[import]
+        import google.auth  # type: ignore[import]
+        from google.auth.exceptions import DefaultCredentialsError  # type: ignore[import]
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "google-auth is required for Google Drive operations. "
+            "Install with `pip install google-auth`."
+        ) from exc
+
+    if credentials_path:
+        creds = Credentials.from_service_account_file(
+            str(credentials_path), scopes=_GDRIVE_SCOPES
+        )
+    else:
+        try:
+            creds, _ = google.auth.default(scopes=_GDRIVE_SCOPES)
+        except DefaultCredentialsError as exc:
+            raise RuntimeError(
+                "Google Drive operations require credentials. "
+                "Provide a service account JSON file via --gdrive-credentials "
+                "or set GOOGLE_APPLICATION_CREDENTIALS."
+            ) from exc
+
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def upload_to_gdrive(
+    backup_path: Path,
+    *,
+    target: StorageTarget,
+    credentials_path: Optional[Path],
+    dry_run: bool,
+) -> None:
+    if target.kind != "gdrive":
+        raise ConfigurationError("upload_to_gdrive requires a Google Drive storage target.")
+    folder_id = target.drive_folder_id
+    if not folder_id:
+        raise ConfigurationError("Google Drive storage requires a folder identifier.")
+
+    logging.info(
+        "Uploading %s to gdrive://%s/%s", backup_path.name, folder_id, backup_path.name
+    )
+
+    if dry_run:
+        return
+
+    service = create_gdrive_service(credentials_path)
+
+    existing = _gdrive_find_existing(service, folder_id, backup_path.name)
+    if existing is not None:
+        logging.info(
+            "Backup %s already present in gdrive://%s/%s, skipping upload",
+            backup_path.name,
+            folder_id,
+            backup_path.name,
+        )
+        return
+
+    try:
+        from googleapiclient.http import MediaFileUpload  # type: ignore[import]
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "google-api-python-client is required for Google Drive uploads. "
+            "Install with `pip install google-api-python-client`."
+        ) from exc
+
+    media = MediaFileUpload(str(backup_path), resumable=False)
+    file_metadata = {"name": backup_path.name, "parents": [folder_id]}
+    service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+
+
+def _gdrive_find_existing(service, folder_id: str, name: str):
+    escaped_name = name.replace("'", "\\'")
+    query = (
+        f"'{folder_id}' in parents and name = '{escaped_name}' and trashed = false"
+    )
+    response = (
+        service.files()
+        .list(
+            q=query,
+            spaces="drive",
+            fields="files(id,name)",
+            pageSize=1,
+        )
+        .execute()
+    )
+    files = response.get("files", [])
+    if not files:
+        return None
+    return files[0]
+
+
+def list_gdrive_backups(
+    *,
+    target: StorageTarget,
+    credentials_path: Optional[Path],
+) -> List[Tuple[datetime, DriveFileRef]]:
+    if target.kind != "gdrive":
+        raise ConfigurationError("list_gdrive_backups requires a Google Drive storage target.")
+    folder_id = target.drive_folder_id
+    if not folder_id:
+        raise ConfigurationError("Google Drive storage requires a folder identifier.")
+
+    service = create_gdrive_service(credentials_path)
+
+    backups: List[Tuple[datetime, DriveFileRef]] = []
+    page_token: Optional[str] = None
+    query = f"'{folder_id}' in parents and trashed = false"
+
+    while True:
+        response = (
+            service.files()
+            .list(
+                q=query,
+                spaces="drive",
+                pageSize=1000,
+                fields="nextPageToken, files(id, name)",
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        for file_info in response.get("files", []):
+            name = file_info.get("name", "")
+            if not name.endswith(".zip"):
+                continue
+            try:
+                timestamp = datetime.strptime(Path(name).stem, BACKUP_FORMAT)
+            except ValueError:
+                logging.debug(
+                    "Skipping non-conforming Google Drive backup %s", name
+                )
+                continue
+            backups.append(
+                (timestamp, DriveFileRef(file_id=file_info["id"], name=name))
+            )
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    backups.sort(key=lambda item: item[0])
+    return backups
+
+
+def delete_gdrive_backups(
+    files: Iterable[DriveFileRef],
+    *,
+    target: StorageTarget,
+    credentials_path: Optional[Path],
+    dry_run: bool,
+) -> None:
+    if target.kind != "gdrive":
+        raise ConfigurationError("delete_gdrive_backups requires a Google Drive storage target.")
+    folder_id = target.drive_folder_id
+    if not folder_id:
+        raise ConfigurationError("Google Drive storage requires a folder identifier.")
+
+    file_list = list(files)
+    if not file_list:
+        return
+
+    if dry_run:
+        return
+
+    service = create_gdrive_service(credentials_path)
+    for file_ref in file_list:
+        service.files().delete(fileId=file_ref.file_id).execute()
+
+
 def copy_to_local(backup_path: Path, *, destination: Optional[Path], dry_run: bool) -> None:
     if destination is None:
         raise ConfigurationError("Local storage requires a destination path.")
@@ -703,6 +932,12 @@ def find_storage_backups(
             aws_region=config.aws_region,
         )
         return backups
+    if target.kind == "gdrive":
+        backups = list_gdrive_backups(
+            target=target,
+            credentials_path=config.gdrive_credentials,
+        )
+        return backups
     return []
 
 
@@ -769,9 +1004,9 @@ def process_backups(
                     candidate.reason,
                 )
                 local_paths.append(path)
-            delete_old_backups(
-                local_paths, dry_run=config.dry_run, suppress_logging=True
-            )
+                delete_old_backups(
+                    local_paths, dry_run=config.dry_run, suppress_logging=True
+                )
         elif target.kind == "s3":
             bucket = target.bucket or ""
             s3_keys: List[str] = []
@@ -792,6 +1027,25 @@ def process_backups(
                 aws_region=config.aws_region,
                 dry_run=config.dry_run,
                 suppress_logging=True,
+            )
+        elif target.kind == "gdrive":
+            folder_id = target.drive_folder_id or ""
+            drive_refs: List[DriveFileRef] = []
+            for candidate in deletions:
+                ref = cast(DriveFileRef, candidate.target)
+                logging.info(
+                    "%s storage backup gdrive://%s/%s: %s",
+                    action,
+                    folder_id,
+                    ref.name,
+                    candidate.reason,
+                )
+                drive_refs.append(ref)
+            delete_gdrive_backups(
+                drive_refs,
+                target=target,
+                credentials_path=config.gdrive_credentials,
+                dry_run=config.dry_run,
             )
         else:
             logging.warning(

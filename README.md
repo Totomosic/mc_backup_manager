@@ -5,7 +5,7 @@ MCBackupManager is a lightweight utility for managing Minecraft world backup arc
 ## Features
 
 - Detects the latest ZIP archive in a backup directory and uploads or copies it to the configured destination.
-- Supports both local filesystem targets and S3 buckets (including AWS profile and region selection).
+- Supports local filesystem targets, S3 buckets, and Google Drive folders (with service-account authentication).
 - Retains only the newest backup locally while keeping a sequence of storage “checkpoints” (e.g. hourly, daily, weekly, monthly).
 - Optional loop mode for continuous monitoring with a configurable poll interval.
 - Dry-run support to preview actions without copying or deleting files.
@@ -37,10 +37,11 @@ MCBackupManager is a lightweight utility for managing Minecraft world backup arc
 Key settings inside the `[backup]` section:
 
 - `backup_dir`: Path containing ZIP archives produced by the Minecraft server.
-- `storage_uri` or `storage.<name>.uri`: Define where backups are copied. The legacy `storage_uri` option configures a single destination. To configure multiple storages, add one or more `storage.<name>.uri` entries (e.g. `storage.primary.uri = s3://bucket/world` and `storage.secondary.uri = /mnt/nas/world`).
+- `storage_uri` or `storage.<name>.uri`: Define where backups are copied. The legacy `storage_uri` option configures a single destination. To configure multiple storages, add one or more `storage.<name>.uri` entries (e.g. `storage.primary.uri = s3://bucket/world`, `storage.secondary.uri = /mnt/nas/world`, or `storage.drive.uri = gdrive://<folder_id>`).
 - `aws_profile` / `aws_region`: Optional AWS overrides when targeting S3.
 - `loop` and `poll_interval`: Enable continuous monitoring of the backup directory.
 - `retention_checkpoints`: Comma-separated durations (e.g. `24h,7d,30d`) that define how the pruning logic collapses older backups into broader time buckets. Durations accept `s`, `m`, `h`, `d`, or `w` suffixes. When multiple storages are configured, this value acts as a default; override it per storage with `storage.<name>.retention_checkpoints` or set `storage.<name>.retention_checkpoints = none` to keep only the latest backup on that target.
+- `gdrive_credentials`: Path to a Google service-account JSON file. Required when any storage target uses `gdrive://`.
 
 All settings can also be passed via CLI flags (run `./backup_manager.py --help` for the full list) to override values loaded from the config file.
 
@@ -50,7 +51,9 @@ When using the CLI, repeat `--storage` to register multiple destinations. Each e
 ./backup_manager.py \
   --backup-dir /opt/minecraft/backups \
   --storage "s3://bucket/world|24h,7d,30d" \
-  --storage "/mnt/nas/world|none"
+  --storage "/mnt/nas/world|none" \
+  --storage "gdrive://1aBcD234EFgHiJkLm|24h,7d" \
+  --gdrive-credentials /path/to/service_account.json
 ```
 
 ### Understanding Retention Checkpoints
@@ -87,6 +90,12 @@ Simulate actions without copying or deleting files:
 ./backup_manager.py --config config.ini --dry-run
 ```
 
+Restore a backup archive onto a server directory:
+
+```bash
+./restore_backup.py path/to/backup.zip /opt/minecraft/server --log-level INFO
+```
+
 ## Testing
 
 Execute the test suite (uses `pytest`):
@@ -105,5 +114,22 @@ TMPDIR=$(pwd)/.tmp pytest
 
 - `backup_manager.py` – main executable module containing CLI and backup logic.
 - `config.example.ini` – sample configuration file.
-- `tests/` – unit tests covering backup discovery, pruning logic, and S3 interactions.
+- `tests/` – unit tests covering backup discovery, pruning logic, and integrations (local, S3, Google Drive).
 - `create_mock_backup.py` – helper for generating sample backup archives (useful in testing or demos).
+### Google Drive Configuration
+
+Google Drive support relies on a service account. Install the Google client libraries:
+
+```bash
+pip install google-api-python-client google-auth
+```
+
+Share the destination Drive folder with the service account and note the folder ID (from the URL, the long alphanumeric segment). In the config file, add:
+
+```
+storage.drive.uri = gdrive://<folder_id>
+storage.drive.retention_checkpoints = none
+gdrive_credentials = /absolute/path/to/service-account.json
+```
+
+Alternatively, supply the same values via CLI flags. If you prefer using user credentials instead of a service account, set `GOOGLE_APPLICATION_CREDENTIALS` and omit `gdrive_credentials`; the script will fall back to `google.auth.default`.
