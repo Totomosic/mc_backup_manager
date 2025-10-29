@@ -15,6 +15,7 @@ import backup_manager
 from backup_manager import (
     BACKUP_FORMAT,
     BackupConfig,
+    StoragePolicy,
     StorageTarget,
     configure_logging,
     process_backups,
@@ -31,19 +32,41 @@ def make_backup(path: Path, name: str, content: bytes) -> Path:
 def build_config(
     *,
     backup_dir: Path,
-    storage: StorageTarget,
+    storage: Optional[StorageTarget] = None,
+    storages: Optional[List[StoragePolicy]] = None,
     dry_run: bool = False,
     retention_checkpoints: Optional[List[int]] = None,
 ) -> BackupConfig:
+    if storages is not None:
+        if retention_checkpoints is not None:
+            raise ValueError(
+                "retention_checkpoints should not be provided when storages is set."
+            )
+        storage_policies = [
+            StoragePolicy(
+                target=policy.target,
+                retention_checkpoints=list(policy.retention_checkpoints),
+            )
+            for policy in storages
+        ]
+    else:
+        if storage is None:
+            raise ValueError("storage must be provided when storages is None.")
+        storage_policies = [
+            StoragePolicy(
+                target=storage,
+                retention_checkpoints=list(retention_checkpoints or []),
+            )
+        ]
+
     return BackupConfig(
         backup_dir=backup_dir,
-        storage=storage,
+        storages=storage_policies,
         aws_profile=None,
         aws_region=None,
         loop=False,
         poll_interval=60,
         dry_run=dry_run,
-        retention_checkpoints=list(retention_checkpoints or []),
     )
 
 
@@ -390,6 +413,53 @@ def test_process_backups_hourly_with_multi_tier_retention(tmp_path: Path) -> Non
     assert backup_dir_remaining == [expected_storage[-1]]
 
 
+def test_process_backups_handles_multiple_storage_policies(tmp_path: Path) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    primary_storage = tmp_path / "primary"
+    secondary_storage = tmp_path / "secondary"
+    primary_storage.mkdir()
+    secondary_storage.mkdir()
+
+    old_name = "2024-01-01-13-00-00.zip"
+    latest_name = "2024-01-01-14-00-00.zip"
+
+    make_backup(backup_dir, old_name, b"old")
+    latest_file = make_backup(backup_dir, latest_name, b"latest")
+
+    make_backup(primary_storage, old_name, b"primary-old")
+    make_backup(secondary_storage, old_name, b"secondary-old")
+
+    config = build_config(
+        backup_dir=backup_dir,
+        storages=[
+            StoragePolicy(
+                target=StorageTarget(kind="local", path=primary_storage),
+                retention_checkpoints=[],
+            ),
+            StoragePolicy(
+                target=StorageTarget(kind="local", path=secondary_storage),
+                retention_checkpoints=[24 * 60 * 60],
+            ),
+        ],
+    )
+
+    exit_code, last_uploaded = process_backups(config, last_uploaded=None)
+
+    assert exit_code == 0
+    assert last_uploaded == latest_name
+
+    assert sorted(path.name for path in backup_dir.iterdir()) == [latest_name]
+    assert sorted(path.name for path in primary_storage.iterdir()) == [latest_name]
+    assert sorted(path.name for path in secondary_storage.iterdir()) == [
+        old_name,
+        latest_name,
+    ]
+
+    assert (primary_storage / latest_name).read_bytes() == latest_file.read_bytes()
+    assert (secondary_storage / old_name).read_bytes() == b"secondary-old"
+
+
 def test_process_backups_applies_retention_to_s3_storage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -436,13 +506,12 @@ def test_process_backups_applies_retention_to_s3_storage(
 
     def fake_list_s3_backups(
         *,
-        bucket: Optional[str],
-        prefix: Optional[str],
+        target: StorageTarget,
         aws_profile: Optional[str],
         aws_region: Optional[str],
     ) -> List[Tuple[datetime, str]]:
-        assert bucket == "my-bucket"
-        assert prefix == "world"
+        assert target.bucket == "my-bucket"
+        assert target.prefix == "world"
         return s3_backups
 
     monkeypatch.setattr(backup_manager, "list_s3_backups", fake_list_s3_backups)
@@ -452,13 +521,13 @@ def test_process_backups_applies_retention_to_s3_storage(
     def fake_delete_s3_backups(
         keys: Iterable[str],
         *,
-        bucket: Optional[str],
+        target: StorageTarget,
         aws_profile: Optional[str],
         aws_region: Optional[str],
         dry_run: bool,
         suppress_logging: bool = False,
     ) -> None:
-        assert bucket == "my-bucket"
+        assert target.bucket == "my-bucket"
         assert not dry_run
         assert suppress_logging is True
         deletions.extend(keys)
@@ -621,7 +690,8 @@ def test_process_backups_skips_without_new_backup(tmp_path: Path, monkeypatch: p
 
     def fake_upload(cfg: BackupConfig, path: Path) -> None:
         calls.append(path.name)
-        backup_manager.copy_to_local(path, destination=cfg.storage.path, dry_run=cfg.dry_run)
+        storage_path = cfg.storages[0].target.path
+        backup_manager.copy_to_local(path, destination=storage_path, dry_run=cfg.dry_run)
 
     monkeypatch.setattr(backup_manager, "upload_backup", fake_upload)
 
@@ -642,8 +712,7 @@ def test_upload_to_s3_uses_boto3(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 
     upload_to_s3(
         backup_file,
-        bucket="my-bucket",
-        prefix="minecraft/world",
+        target=StorageTarget(kind="s3", bucket="my-bucket", prefix="minecraft/world"),
         aws_profile="profile",
         aws_region="us-east-1",
         dry_run=False,
@@ -661,8 +730,7 @@ def test_upload_to_s3_skips_existing(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     upload_to_s3(
         backup_file,
-        bucket="existing-bucket",
-        prefix="minecraft",
+        target=StorageTarget(kind="s3", bucket="existing-bucket", prefix="minecraft"),
         aws_profile=None,
         aws_region=None,
         dry_run=False,

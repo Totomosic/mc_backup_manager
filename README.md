@@ -37,12 +37,21 @@ MCBackupManager is a lightweight utility for managing Minecraft world backup arc
 Key settings inside the `[backup]` section:
 
 - `backup_dir`: Path containing ZIP archives produced by the Minecraft server.
-- `storage_uri`: Either a filesystem path (`/mnt/backups/world`) or an S3 URI (`s3://bucket/prefix`).
+- `storage_uri` or `storage.<name>.uri`: Define where backups are copied. The legacy `storage_uri` option configures a single destination. To configure multiple storages, add one or more `storage.<name>.uri` entries (e.g. `storage.primary.uri = s3://bucket/world` and `storage.secondary.uri = /mnt/nas/world`).
 - `aws_profile` / `aws_region`: Optional AWS overrides when targeting S3.
 - `loop` and `poll_interval`: Enable continuous monitoring of the backup directory.
-- `retention_checkpoints`: Comma-separated durations (e.g. `24h,7d,30d`) that define how the pruning logic collapses older backups into broader time buckets. Durations accept `s`, `m`, `h`, `d`, or `w` suffixes.
+- `retention_checkpoints`: Comma-separated durations (e.g. `24h,7d,30d`) that define how the pruning logic collapses older backups into broader time buckets. Durations accept `s`, `m`, `h`, `d`, or `w` suffixes. When multiple storages are configured, this value acts as a default; override it per storage with `storage.<name>.retention_checkpoints` or set `storage.<name>.retention_checkpoints = none` to keep only the latest backup on that target.
 
 All settings can also be passed via CLI flags (run `./backup_manager.py --help` for the full list) to override values loaded from the config file.
+
+When using the CLI, repeat `--storage` to register multiple destinations. Each entry accepts an optional retention override after a pipe (`|`). For example:
+
+```bash
+./backup_manager.py \
+  --backup-dir /opt/minecraft/backups \
+  --storage "s3://bucket/world|24h,7d,30d" \
+  --storage "/mnt/nas/world|none"
+```
 
 ### Understanding Retention Checkpoints
 

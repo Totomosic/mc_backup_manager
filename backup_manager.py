@@ -37,15 +37,20 @@ class StorageTarget:
 
 
 @dataclass
+class StoragePolicy:
+    target: StorageTarget
+    retention_checkpoints: List[int] = field(default_factory=list)
+
+
+@dataclass
 class BackupConfig:
     backup_dir: Path
-    storage: StorageTarget
+    storages: List[StoragePolicy]
     aws_profile: Optional[str] = None
     aws_region: Optional[str] = None
     loop: bool = False
     poll_interval: int = 60
     dry_run: bool = False
-    retention_checkpoints: List[int] = field(default_factory=list)  # seconds
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -65,8 +70,20 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--storage",
-        dest="storage_uri",
-        help="Storage target URI (e.g. s3://bucket/prefix or /path/to/storage).",
+        dest="storage_uris",
+        action="append",
+        metavar="URI[|RETENTION]",
+        help=(
+            "Storage target definition. Repeat to configure multiple storages. "
+            "Optionally append '|retention_checkpoints' to override the global "
+            "retention policy (e.g. s3://bucket/backups|24h,7d,30d)."
+        ),
+    )
+    parser.add_argument(
+        "--storage-uri",
+        dest="storage_uris",
+        action="append",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--aws-profile",
@@ -133,7 +150,6 @@ def merge_config(
     file_cfg = file_config or {}
 
     backup_dir_value = args.backup_dir or file_cfg.get("backup_dir")
-    storage_value = args.storage_uri or file_cfg.get("storage_uri")
     aws_profile = args.aws_profile if args.aws_profile is not None else file_cfg.get("aws_profile")
     aws_region = args.aws_region if args.aws_region is not None else file_cfg.get("aws_region")
 
@@ -166,22 +182,124 @@ def merge_config(
 
     if not backup_dir_value:
         raise ConfigurationError("backup_dir must be supplied via CLI or config file.")
-    if not storage_value:
-        raise ConfigurationError("storage must be supplied via CLI or config file.")
+
+    cli_storage_defs = args.storage_uris or []
+    storage_entries: List[Tuple[str, Optional[str]]] = []
+    if cli_storage_defs:
+        storage_entries = [_parse_storage_cli_value(entry) for entry in cli_storage_defs]
+    else:
+        storage_entries = _collect_config_storage_entries(file_cfg)
+
+        legacy_storage = file_cfg.get("storage_uri")
+        if legacy_storage:
+            if storage_entries:
+                raise ConfigurationError(
+                    "Cannot mix legacy storage_uri with storage.<name>.* entries."
+                )
+            storage_entries = [(legacy_storage, file_cfg.get("retention_checkpoints"))]
+
+    if not storage_entries:
+        raise ConfigurationError("At least one storage definition must be supplied.")
 
     backup_dir = Path(backup_dir_value).expanduser().resolve()
-    storage = parse_storage(storage_value)
+    default_retention = retention_value
+
+    storages: List[StoragePolicy] = []
+    for uri, retention_override in storage_entries:
+        target = parse_storage(uri)
+        retention_policy = _resolve_retention_policy(
+            retention_override, default_retention
+        )
+        storages.append(
+            StoragePolicy(target=target, retention_checkpoints=retention_policy)
+        )
 
     return BackupConfig(
         backup_dir=backup_dir,
-        storage=storage,
+        storages=storages,
         aws_profile=aws_profile,
         aws_region=aws_region,
         loop=loop,
         poll_interval=poll_value,
         dry_run=args.dry_run,
-        retention_checkpoints=retention_value,
     )
+
+
+def _parse_storage_cli_value(value: str) -> Tuple[str, Optional[str]]:
+    raw = value.strip()
+    if not raw:
+        raise ConfigurationError("Storage definition cannot be empty.")
+
+    parts = raw.split("|", 1)
+    uri = parts[0].strip()
+    if not uri:
+        raise ConfigurationError(
+            "Storage definition must include a URI before the retention separator."
+        )
+
+    if len(parts) == 1:
+        return uri, None
+
+    retention = parts[1].strip()
+    return uri, retention
+
+
+def _collect_config_storage_entries(
+    file_cfg: Dict[str, str],
+) -> List[Tuple[str, Optional[str]]]:
+    grouped: Dict[str, Dict[str, str]] = {}
+    order: List[str] = []
+    for key, value in file_cfg.items():
+        if not key.startswith("storage."):
+            continue
+        segments = key.split(".")
+        if len(segments) < 3:
+            raise ConfigurationError(
+                "Config storage entries must use the storage.<name>.<field> format."
+            )
+        name = segments[1]
+        field = ".".join(segments[2:])
+        if name not in grouped:
+            grouped[name] = {}
+            order.append(name)
+        grouped[name][field] = value
+
+    entries: List[Tuple[str, Optional[str]]] = []
+    for name in order:
+        fields = grouped[name]
+        uri = (
+            fields.get("uri")
+            or fields.get("path")
+            or fields.get("location")
+            or fields.get("storage_uri")
+        )
+        if uri is None:
+            raise ConfigurationError(
+                f"storage.{name}.uri (or .path/.location) must be provided."
+            )
+        retention = fields.get("retention_checkpoints") or fields.get("retention")
+        entries.append((uri, retention))
+
+    return entries
+
+
+def _resolve_retention_policy(
+    override: Optional[str], default_retention: List[int]
+) -> List[int]:
+    if override is None:
+        return list(default_retention)
+
+    text = override.strip()
+    if not text:
+        return []
+
+    lowered = text.lower()
+    if lowered in {"default", "inherit"}:
+        return list(default_retention)
+    if lowered in {"none", "off", "disable", "disabled"}:
+        return []
+
+    return parse_duration_list(text)
 
 
 def parse_storage(storage_uri: str) -> StorageTarget:
@@ -316,32 +434,38 @@ def find_backups(backup_dir: Path) -> List[Tuple[datetime, Path]]:
 
 
 def upload_backup(config: BackupConfig, backup_path: Path) -> None:
-    if config.storage.kind == "s3":
-        upload_to_s3(
-            backup_path,
-            bucket=config.storage.bucket,
-            prefix=config.storage.prefix,
-            aws_profile=config.aws_profile,
-            aws_region=config.aws_region,
-            dry_run=config.dry_run,
-        )
-    elif config.storage.kind == "local":
-        copy_to_local(
-            backup_path, destination=config.storage.path, dry_run=config.dry_run
-        )
-    else:
-        raise ConfigurationError(f"Unsupported storage kind: {config.storage.kind}")
+    for policy in config.storages:
+        target = policy.target
+        if target.kind == "s3":
+            upload_to_s3(
+                backup_path,
+                target=target,
+                aws_profile=config.aws_profile,
+                aws_region=config.aws_region,
+                dry_run=config.dry_run,
+            )
+        elif target.kind == "local":
+            copy_to_local(
+                backup_path, destination=target.path, dry_run=config.dry_run
+            )
+        else:
+            raise ConfigurationError(f"Unsupported storage kind: {target.kind}")
 
 
 def upload_to_s3(
     backup_path: Path,
     *,
-    bucket: Optional[str],
-    prefix: Optional[str],
+    target: StorageTarget,
     aws_profile: Optional[str],
     aws_region: Optional[str],
     dry_run: bool,
 ) -> None:
+    if target.kind != "s3":
+        raise ConfigurationError("upload_to_s3 requires an S3 storage target.")
+
+    bucket = target.bucket
+    prefix = target.prefix
+
     if bucket is None:
         raise ConfigurationError("S3 uploads require a bucket.")
 
@@ -398,11 +522,16 @@ def create_s3_client(
 
 def list_s3_backups(
     *,
-    bucket: Optional[str],
-    prefix: Optional[str],
+    target: StorageTarget,
     aws_profile: Optional[str],
     aws_region: Optional[str],
 ) -> List[Tuple[datetime, str]]:
+    if target.kind != "s3":
+        raise ConfigurationError("list_s3_backups requires an S3 storage target.")
+
+    bucket = target.bucket
+    prefix = target.prefix
+
     if bucket is None:
         raise ConfigurationError("S3 storage requires a bucket.")
 
@@ -435,12 +564,17 @@ def list_s3_backups(
 def delete_s3_backups(
     keys: Iterable[str],
     *,
-    bucket: Optional[str],
+    target: StorageTarget,
     aws_profile: Optional[str],
     aws_region: Optional[str],
     dry_run: bool,
     suppress_logging: bool = False,
 ) -> None:
+    if target.kind != "s3":
+        raise ConfigurationError("delete_s3_backups requires an S3 storage target.")
+
+    bucket = target.bucket
+
     if bucket is None:
         raise ConfigurationError("S3 storage requires a bucket.")
 
@@ -553,17 +687,18 @@ def delete_old_backups(backups: Iterable[Path], *, dry_run: bool, suppress_loggi
 
 
 def find_storage_backups(
-    config: BackupConfig,
+    config: BackupConfig, policy: StoragePolicy
 ) -> List[Tuple[datetime, Union[Path, str]]]:
-    if config.storage.kind == "local":
-        storage_path = config.storage.path
+    target = policy.target
+
+    if target.kind == "local":
+        storage_path = target.path
         if storage_path is None or not storage_path.exists():
             return []
         return find_backups(storage_path)
-    if config.storage.kind == "s3":
+    if target.kind == "s3":
         backups = list_s3_backups(
-            bucket=config.storage.bucket,
-            prefix=config.storage.prefix,
+            target=target,
             aws_profile=config.aws_profile,
             aws_region=config.aws_region,
         )
@@ -606,61 +741,77 @@ def process_backups(
     local_deletions = [path for _, path in backups[:-1]]
     delete_old_backups(local_deletions, dry_run=config.dry_run)
 
-    storage_backups = find_storage_backups(config)
-    if storage_backups:
-        deletions = determine_backups_to_delete(
-            storage_backups, config.retention_checkpoints
-        )
-        deletion_count = len(deletions)
-        if deletions:
-            action = "Would delete" if config.dry_run else "Deleting"
-            if config.storage.kind == "local":
-                local_paths: List[Path] = []
-                for candidate in deletions:
-                    path = cast(Path, candidate.target)
-                    logging.info(
-                        "%s storage backup %s: %s",
-                        action,
-                        path,
-                        candidate.reason,
-                    )
-                    local_paths.append(path)
-                delete_old_backups(
-                    local_paths, dry_run=config.dry_run, suppress_logging=True
-                )
-            elif config.storage.kind == "s3":
-                bucket = config.storage.bucket or ""
-                s3_keys: List[str] = []
-                for candidate in deletions:
-                    key = cast(str, candidate.target)
-                    logging.info(
-                        "%s storage backup s3://%s/%s: %s",
-                        action,
-                        bucket,
-                        key,
-                        candidate.reason,
-                    )
-                    s3_keys.append(key)
-                delete_s3_backups(
-                    s3_keys,
-                    bucket=config.storage.bucket,
-                    aws_profile=config.aws_profile,
-                    aws_region=config.aws_region,
-                    dry_run=config.dry_run,
-                    suppress_logging=True,
-                )
+    total_deletions = 0
+    for policy in config.storages:
+        storage_backups = find_storage_backups(config, policy)
+        if not storage_backups:
+            continue
 
-        if not config.dry_run and not config.loop:
-            logging.info(
-                "Completed backup cycle: uploaded %s; pruned %d storage backups.",
-                latest_backup.name,
-                deletion_count,
-            )
-    elif not config.dry_run and not config.loop:
-        logging.info(
-            "Completed backup cycle: uploaded %s; no storage pruning required.",
-            latest_backup.name,
+        deletions = determine_backups_to_delete(
+            storage_backups, policy.retention_checkpoints
         )
+        total_deletions += len(deletions)
+
+        if not deletions:
+            continue
+
+        action = "Would delete" if config.dry_run else "Deleting"
+        target = policy.target
+
+        if target.kind == "local":
+            local_paths: List[Path] = []
+            for candidate in deletions:
+                path = cast(Path, candidate.target)
+                logging.info(
+                    "%s storage backup %s: %s",
+                    action,
+                    path,
+                    candidate.reason,
+                )
+                local_paths.append(path)
+            delete_old_backups(
+                local_paths, dry_run=config.dry_run, suppress_logging=True
+            )
+        elif target.kind == "s3":
+            bucket = target.bucket or ""
+            s3_keys: List[str] = []
+            for candidate in deletions:
+                key = cast(str, candidate.target)
+                logging.info(
+                    "%s storage backup s3://%s/%s: %s",
+                    action,
+                    bucket,
+                    key,
+                    candidate.reason,
+                )
+                s3_keys.append(key)
+            delete_s3_backups(
+                s3_keys,
+                target=target,
+                aws_profile=config.aws_profile,
+                aws_region=config.aws_region,
+                dry_run=config.dry_run,
+                suppress_logging=True,
+            )
+        else:
+            logging.warning(
+                "Skipping retention pruning for unsupported storage kind %s",
+                target.kind,
+            )
+
+    if not config.dry_run and not config.loop:
+        if total_deletions:
+            logging.info(
+                "Completed backup cycle: uploaded %s; pruned %d storage backups across %d target(s).",
+                latest_backup.name,
+                total_deletions,
+                len(config.storages),
+            )
+        else:
+            logging.info(
+                "Completed backup cycle: uploaded %s; no storage pruning required.",
+                latest_backup.name,
+            )
 
     return 0, latest_backup.name
 
