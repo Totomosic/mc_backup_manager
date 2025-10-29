@@ -101,6 +101,18 @@ def test_configure_logging_only_adjusts_root() -> None:
             logging.getLogger(name).setLevel(level)
 
 
+def test_log_effective_configuration_emits_details(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    storage = StorageTarget(kind="local", path=tmp_path / "dest")
+    config = build_config(backup_dir=tmp_path, storage=storage)
+
+    caplog.set_level(logging.INFO)
+    backup_manager._log_effective_configuration(config)
+
+    messages = [record.message for record in caplog.records]
+    assert any("backup_dir" in message for message in messages)
+    assert any("Storage 1" in message for message in messages)
+
+
 def setup_fake_boto3(monkeypatch: pytest.MonkeyPatch, *, object_exists: bool) -> Tuple[List[Tuple[str, str, str]], Dict[str, str]]:
     uploads: List[Tuple[str, str, str]] = []
     session_kwargs: Dict[str, str] = {}

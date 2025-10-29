@@ -330,6 +330,52 @@ def _resolve_retention_policy(
     return parse_duration_list(text)
 
 
+def _format_retention(retention: List[int]) -> str:
+    if not retention:
+        return "none"
+    return ", ".join(format_duration(value) for value in retention)
+
+
+def _describe_storage_target(target: StorageTarget) -> str:
+    if target.kind == "s3":
+        bucket = target.bucket or "<unknown>"
+        prefix = target.prefix or "(root)"
+        return f"bucket={bucket}, prefix={prefix}"
+    if target.kind == "local":
+        path = target.path or Path("<unspecified>")
+        return f"path={path}"
+    if target.kind == "gdrive":
+        folder = target.drive_folder_id or "<unknown>"
+        return f"folder_id={folder}"
+    return "details=unsupported"
+
+
+def _log_effective_configuration(config: BackupConfig) -> None:
+    logging.info(
+        "Backup parameters: backup_dir=%s, loop=%s, poll_interval=%s, dry_run=%s",
+        config.backup_dir,
+        config.loop,
+        config.poll_interval,
+        config.dry_run,
+    )
+    logging.info(
+        "Credentials: aws_profile=%s, aws_region=%s, gdrive_credentials=%s",
+        config.aws_profile or "none",
+        config.aws_region or "none",
+        config.gdrive_credentials or "none",
+    )
+    logging.info("Configured storage targets: %d", len(config.storages))
+    for index, policy in enumerate(config.storages, start=1):
+        target = policy.target
+        logging.info(
+            "Storage %d [%s]: %s; retention=%s",
+            index,
+            target.kind,
+            _describe_storage_target(target),
+            _format_retention(policy.retention_checkpoints),
+        )
+
+
 def parse_storage(storage_uri: str) -> StorageTarget:
     parsed = urlparse(storage_uri)
     scheme = parsed.scheme.lower()
@@ -1087,6 +1133,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     except ConfigurationError as error:
         logging.error("%s", error)
         return 2
+
+    _log_effective_configuration(config)
 
     if not config.backup_dir.exists():
         logging.error(
